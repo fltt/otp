@@ -2,8 +2,10 @@
 
 # emacs
 *~
-lib/tools/emacs/*.elc
+.emacs.desktop*
 TAGS
+lib/tools/emacs/*.elc
+
 # vim
 .*.sw[a-z]
 
