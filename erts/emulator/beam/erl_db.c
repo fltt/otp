@@ -174,7 +174,6 @@ typedef enum {
     LCK_NONE=4
 } db_lock_kind_t;
 
-extern DbTableMethod db_hash;
 extern DbTableMethod db_nested_hash;
 extern DbTableMethod db_tree;
 
@@ -606,12 +605,8 @@ static ERTS_INLINE void local_fix_table(DbTable* tb)
 static ERTS_INLINE void local_unfix_table(DbTable* tb)
 {
     if (erts_smp_refc_dectest(&tb->common.ref, 0) == 0) {
-        if (IS_NESTED_HASH_TABLE(tb->common.status)) {
-            db_unfix_table_nhash(&(tb->nested));
-        } else {
-            ASSERT(IS_HASH_TABLE(tb->common.status));
-            db_unfix_table_hash(&(tb->hash));
-        }
+        ASSERT(IS_NESTED_HASH_TABLE(tb->common.status));
+        db_unfix_table_nhash(&(tb->nested));
     }
 }
 
@@ -1453,14 +1448,6 @@ BIF_RETTYPE ets_new_2(BIF_ALIST_2)
     }
     if (IS_NESTED_HASH_TABLE(status)) {
 	meth = &db_nested_hash;
-#ifdef ERTS_SMP
-	if (is_fine_locked && !(status & DB_PRIVATE)) {
-	    status |= DB_FINE_LOCKED;
-	}
-#endif
-    }
-    else if (IS_HASH_TABLE(status)) {
-	meth = &db_hash;
 #ifdef ERTS_SMP
 	if (is_fine_locked && !(status & DB_PRIVATE)) {
 	    status |= DB_FINE_LOCKED;
@@ -2975,7 +2962,6 @@ void init_db(ErtsDbSpinCount db_spin_count)
 	meta_name_tab[i].u.name_atom = NIL;
     }
 
-    db_initialize_hash();
     db_initialize_nhash();
     db_initialize_tree();
 
@@ -3412,10 +3398,6 @@ erts_db_process_exiting(Process *c_p, ErtsProcLocks c_p_locks)
                                 db_unfix_table_nhash(&(tb->nested));
                                 reds += 40;
                             }
-                            else if (IS_HASH_TABLE(tb->common.status)) {
-                                db_unfix_table_hash(&(tb->hash));
-                                reds += 40;
-                            }
                         }
 		    }
 		    db_unlock(tb, LCK_WRITE_REC);
@@ -3560,10 +3542,8 @@ static void unfix_table_locked(Process* p,  DbTable* tb,
 unlocked:
 
     if (!IS_FIXED(tb)
-        && ((IS_NESTED_HASH_TABLE(tb->common.status)
-             && (erts_smp_atomic_read_nob(&tb->nested.fixdel) != (erts_aint_t)NULL))
-            || (IS_HASH_TABLE(tb->common.status)
-                && (erts_smp_atomic_read_nob(&tb->hash.fixdel) != (erts_aint_t)NULL)))) {
+        && IS_NESTED_HASH_TABLE(tb->common.status)
+        && (erts_smp_atomic_read_nob(&tb->nested.fixdel) != (erts_aint_t)NULL)) {
 #ifdef ERTS_SMP
         if (*kind_p == LCK_READ && tb->common.is_thread_safe) {
             /* Must have write lock while purging pseudo-deleted (OTP-8166) */
@@ -3573,10 +3553,7 @@ unlocked:
             if (tb->common.status & DB_DELETE) return;
         }
 #endif
-        if (IS_NESTED_HASH_TABLE(tb->common.status))
-            db_unfix_table_nhash(&(tb->nested));
-        else
-            db_unfix_table_hash(&(tb->hash));
+        db_unfix_table_nhash(&(tb->nested));
     }
 }
 
@@ -3885,34 +3862,6 @@ static Eterm table_info(Process* p, DbTable* tb, Eterm What)
 	    PUT_DOUBLE(f, hp);
 	    hp += FLOAT_SIZE_OBJECT;
 	    ret = TUPLE7(hp, make_small(erts_smp_atomic_read_nob(&tb->nested.nactive)),
-			 avg, std_dev_real, std_dev_exp,
-			 make_small(stats.min_chain_len),
-			 make_small(stats.max_chain_len),
-			 make_small(stats.kept_items));
-	}
-	else if (IS_HASH_TABLE(tb->common.status)) {
-	    FloatDef f;
-	    DbHashStats stats;
-	    Eterm avg, std_dev_real, std_dev_exp;
-	    Eterm* hp;
-
-	    db_calc_stats_hash(&tb->hash, &stats);
-	    hp = HAlloc(p, 1 + 7 + FLOAT_SIZE_OBJECT*3);
-	    f.fd = stats.avg_chain_len;
-	    avg = make_float(hp);
-	    PUT_DOUBLE(f, hp);
-	    hp += FLOAT_SIZE_OBJECT;
-
-	    f.fd = stats.std_dev_chain_len;
-	    std_dev_real = make_float(hp);
-	    PUT_DOUBLE(f, hp);
-	    hp += FLOAT_SIZE_OBJECT;
-	    
-	    f.fd = stats.std_dev_expected;
-	    std_dev_exp = make_float(hp);
-	    PUT_DOUBLE(f, hp);
-	    hp += FLOAT_SIZE_OBJECT;
-	    ret = TUPLE7(hp, make_small(erts_smp_atomic_read_nob(&tb->hash.nactive)),
 			 avg, std_dev_real, std_dev_exp,
 			 make_small(stats.min_chain_len),
 			 make_small(stats.max_chain_len),

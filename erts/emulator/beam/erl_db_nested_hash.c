@@ -296,11 +296,13 @@ WUNLOCK_HASH(erts_smp_rwmtx_t *lck)
 
 #define IFN_EXCL(tb, cmd) (((tb)->common.is_thread_safe) || (cmd))
 #define IS_HASH_RLOCKED(tb, hval) IFN_EXCL(tb, erts_smp_lc_rwmtx_is_rlocked(GET_LOCK(tb, hval)))
+#define IS_HASH_WLOCKED(tb, lck) IFN_EXCL(tb, erts_smp_lc_rwmtx_is_rwlocked(lck))
 #define IS_TAB_WLOCKED(tb) erts_smp_lc_rwmtx_is_rwlocked(&(tb)->common.rwlock)
 
 #else
 
 #define IS_HASH_RLOCKED(tb, hval) (1)
+#define IS_HASH_WLOCKED(tb, lck) (1)
 #define IS_TAB_WLOCKED(tb) (1)
 
 #endif
@@ -930,6 +932,7 @@ create_stage_2_root(DbTableNestedHash *tb, RootDbTerm *rp2, RootDbTerm *rp3)
     RootDbTerm *nrp, *rp1;
     TrunkDbTerm *tp;
     TrunkDbTerm **tpp;
+    ASSERT(!(tb->common.status & DB_SET));
     nrp = erts_db_alloc(ERTS_ALC_T_DB_TERM, (DbTable *)&tb->common,
                         offsetof(RootDbTerm, dt) + offsetof(TailDbTerm, szm));
     nrp->next = rp3;
@@ -1219,14 +1222,15 @@ grow(DbTableNestedHash *tb, int nactive)
 
 /*
  * Find the next stage 1 RootDbTerm containing a different key.
- * NOTE: *rp2 must be a stage 1 RootDbTerm
+ * NOTE: rp2 must not be NULL and *rp2 must be a stage 1 RootDbTerm
  */
-static RootDbTerm *
+static ERTS_INLINE RootDbTerm *
 next_key(DbTableNestedHash *tb, RootDbTerm *rp2)
 {
     Eterm key;
     HashValue hval;
     RootDbTerm *rp1;
+    ASSERT(!(tb->common.status & DB_SET));
     key = GETKEY(tb, rp2->dt.dbterm.tpl);
     hval = rp2->hvalue;
     if (hval == INVALID_HASH)
@@ -1261,7 +1265,8 @@ build_term_list(Process *p, RootDbTerm *rp1,
     sz = 0;
     list = NIL;
     rp3 = copy_all ? NULL
-        : (HAS_TAIL(rp1) ? ROOT_PTR(rp1)->next
+        : ((HAS_TAIL(rp1) || (tb->common.status & DB_SET))
+           ? ROOT_PTR(rp1)->next
            : next_key(tb, rp1));
     rp5 = rp1;
     do {
@@ -1325,7 +1330,7 @@ add_fixed_deletion(DbTableNestedHash *tb, int ix, erts_aint_t fixated_by_me)
         if (NFIXED(tb) <= fixated_by_me) {
             /* raced by unfixer */
             erts_db_free(ERTS_ALC_T_DB_FIX_DEL, (DbTable*)tb,
-                         fixd, sizeof(FixedDeletion));
+                         fixd, sizeof(NestedFixedDeletion));
             return 0;
         }
         exp_next = was_next;
@@ -1649,7 +1654,7 @@ bucket_has_key(DbTableNestedHash *tb, Eterm key,
         if (has_key(tb, rp1, key, hval)) {
             if (rp2->hvalue != INVALID_HASH)
                 return 1;
-            if (HAS_TAIL(rp1))
+            if (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
                 return 0;
         }
         rp1 = rp2->next;
@@ -1949,8 +1954,8 @@ db_create_nhash(Process *p, DbTable *tbl)
         erts_smp_rwmtx_opt_t rwmtx_opt = ERTS_SMP_RWMTX_OPT_DEFAULT_INITER;
         if (tb->common.type & DB_FREQ_READ)
             rwmtx_opt.type = ERTS_SMP_RWMTX_TYPE_FREQUENT_READ;
-	if (erts_ets_rwmtx_spin_count >= 0)
-	    rwmtx_opt.main_spincount = erts_ets_rwmtx_spin_count;
+        if (erts_ets_rwmtx_spin_count >= 0)
+            rwmtx_opt.main_spincount = erts_ets_rwmtx_spin_count;
         tb->locks = (DbTableNestedHashFineLocks *)
             erts_db_alloc_fnf(ERTS_ALC_T_DB_SEG, /* Other type maybe? */
                               (DbTable *)tb,
@@ -2027,7 +2032,9 @@ db_next_nhash(Process *p, DbTable *tbl, Eterm key, Eterm *ret)
             continue;
         }
         /* Key found */
-        rp1 = HAS_TAIL(rp1) ? rp2->next : next_key(tb, rp2);
+        rp1 = (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
+            ? rp2->next
+            : next_key(tb, rp2);
         for (;;) {
             while (rp1 != NULL) {
                 rp2 = ROOT_PTR(rp1);
@@ -2079,18 +2086,17 @@ db_put_nhash(DbTable *tbl, Eterm obj, int key_clash_fail)
         rpp = &rp2->next;
     }
     if (rp1 == NULL) {
-        rp1 = new_root_dbterm(tb, obj);
-        rp1->next = NULL;
-        rp1->hvalue = hval;
-        *rpp = MAKE_ROOT(rp1, 0);
+        rp2 = new_root_dbterm(tb, obj);
+        rp2->next = NULL;
+        rp2->hvalue = hval;
+        *rpp = MAKE_ROOT(rp2, 0);
+        erts_smp_atomic_inc_nob(&tb->common.nitems);
         nkeys = erts_smp_atomic_inc_read_nob(&tb->nkeys);
         goto done;
     }
-
     /*
      * Key found
      */
-    ASSERT(tb->common.status & (DB_BAG | DB_DUPLICATE_BAG));
     nobj = 0;
     if (key_clash_fail) {
         rp3 = rp1;
@@ -2110,6 +2116,7 @@ db_put_nhash(DbTable *tbl, Eterm obj, int key_clash_fail)
             do {
                 ++nobj;
                 rp4 = ROOT_PTR(rp3);
+                rp3 = rp4->next;
                 if (db_eq(&tb->common, obj, &rp4->dt.dbterm)) {
                     /*
                      * The pseudo-deleted RootDbTerm is always the first
@@ -2118,22 +2125,23 @@ db_put_nhash(DbTable *tbl, Eterm obj, int key_clash_fail)
                      */
                     if (rp4->hvalue == INVALID_HASH) {
                         rp4->hvalue = hval;
+                        erts_smp_atomic_inc_nob(&tb->common.nitems);
                         /*
                          * If the next RootDbTerm has the same key then
-                         * it isn't pseudo-deleted for sure and there's
-                         * no need to increment 'nkeys'.
+                         * it isn't pseudo-deleted for sure and 'nkeys'
+                         * must not be incremented.
                          */
-                        rp3 = rp4->next;
-                        nkeys = ((rp3 != NULL) &&
-                                 has_key(tb, rp3, key, hval))
-                            ? erts_smp_atomic_read_nob(&tb->nkeys)
-                            : erts_smp_atomic_inc_read_nob(&tb->nkeys);
+                        if ((rp3 != NULL) && has_key(tb, rp3, key, hval)) {
+                            ASSERT(ROOT_PTR(rp3)->hvalue != INVALID_HASH);
+                            nkeys = erts_smp_atomic_read_nob(&tb->nkeys);
+                        } else {
+                            nkeys = erts_smp_atomic_inc_read_nob(&tb->nkeys);
+                        }
                         goto done;
                     }
                     WUNLOCK_HASH(lck);
                     return DB_ERROR_NONE;
                 }
-                rp3 = rp4->next;
             } while ((rp3 != NULL) && has_key(tb, rp3, key, hval));
         } else if (HAS_NLHT(rp2)) {
             ohval = MAKE_HASH(obj);
@@ -2158,6 +2166,7 @@ db_put_nhash(DbTable *tbl, Eterm obj, int key_clash_fail)
                 if (db_eq(&tb->common, obj, &tp1->dbterm)) {
                     if (rp2->hvalue == INVALID_HASH) {
                         rp2->hvalue = hval;
+                        erts_smp_atomic_inc_nob(&tb->common.nitems);
                         nkeys = erts_smp_atomic_inc_read_nob(&tb->nkeys);
                         goto done;
                     }
@@ -2167,7 +2176,7 @@ db_put_nhash(DbTable *tbl, Eterm obj, int key_clash_fail)
                 tp1 = tp1->next;
             } while (tp1 != NULL);
         }
-    } else if (!HAS_TAIL(rp1)) { /* DB_DUPLICATE_BAG */
+    } else if ((tb->common.status & DB_DUPLICATE_BAG) && (!HAS_TAIL(rp1))) {
         rp3 = rp1;
         do {
             ++nobj;
@@ -2179,6 +2188,7 @@ db_put_nhash(DbTable *tbl, Eterm obj, int key_clash_fail)
          * Recycle the Root and TrunkDbTerms.
          */
         rp2->hvalue = hval;
+        erts_smp_atomic_inc_nob(&tb->common.nitems);
         if (HAS_TAIL(rp1)) {
             tp1 = TRUNK_PTR(rp2->dt.tail.trunk);
             ASSERT(tp1 != NULL);
@@ -2191,7 +2201,7 @@ db_put_nhash(DbTable *tbl, Eterm obj, int key_clash_fail)
             nkeys = erts_smp_atomic_inc_read_nob(&tb->nkeys);
         } else {
             rp2 = replace_root_dbterm(tb, rp2, obj);
-            ASSERT(nobj > 0);
+            ASSERT((tb->common.status & DB_SET) || (nobj > 0));
             if (nobj >= KEY_CHAIN_THRESHOLD) {
                 rp1 = create_stage_2_root(tb, rp2, rp3);
                 *rpp = MAKE_ROOT(rp1, 1);
@@ -2204,45 +2214,51 @@ db_put_nhash(DbTable *tbl, Eterm obj, int key_clash_fail)
         }
         goto done;
     }
-    if (HAS_TAIL(rp1)) {
-        tp2 = TRUNK_PTR(rp2->dt.tail.trunk);
-        hl = HAS_NLHT(rp2);
-        tp1 = new_trunk_dbterm(tb, obj, hl);
-        tp1->next = tp2;
-        rp2->dt.tail.trunk = MAKE_TRUNK(tp1, hl);
-        ++rp2->dt.tail.nkitems;
-        if (hl) {
-            tp1->sp.segtab = tp2->sp.segtab;
-            tp2->sp.previous = tp1;
-            put_nested_dbterm(tb, rp2, tp1, obj);
-            if (rp2->dt.tail.nkitems >
-                (rp2->dt.tail.nactive * (CHAIN_LEN + 1)))
-                nested_grow(tb, rp2);
+    if (tb->common.status & DB_SET) {
+        rp2 = replace_root_dbterm(tb, rp2, obj);
+        *rpp = MAKE_ROOT(rp2, 0);
+    } else {
+        if (HAS_TAIL(rp1)) {
+            ASSERT(!(tb->common.status & DB_SET));
+            tp2 = TRUNK_PTR(rp2->dt.tail.trunk);
+            hl = HAS_NLHT(rp2);
+            tp1 = new_trunk_dbterm(tb, obj, hl);
+            tp1->next = tp2;
+            rp2->dt.tail.trunk = MAKE_TRUNK(tp1, hl);
+            ++rp2->dt.tail.nkitems;
+            if (hl) {
+                tp1->sp.segtab = tp2->sp.segtab;
+                tp2->sp.previous = tp1;
+                put_nested_dbterm(tb, rp2, tp1, obj);
+                if (rp2->dt.tail.nkitems >
+                    (rp2->dt.tail.nactive * (CHAIN_LEN + 1)))
+                    nested_grow(tb, rp2);
+            } else {
+                if (rp2->dt.tail.nkitems > NESTED_CHAIN_THRESHOLD) {
+                    rp1 = create_stage_3_root(tb, rp2);
+                    *rpp = MAKE_ROOT(rp1, 1);
+                }
+            }
         } else {
-            if (rp2->dt.tail.nkitems > NESTED_CHAIN_THRESHOLD) {
-                rp1 = create_stage_3_root(tb, rp2);
+            rp2 = new_root_dbterm(tb, obj);
+            rp2->next = rp1;
+            rp2->hvalue = hval;
+            ASSERT(nobj > 0);
+            if (nobj >= KEY_CHAIN_THRESHOLD) {
+                rp1 = create_stage_2_root(tb, rp2, rp3);
                 *rpp = MAKE_ROOT(rp1, 1);
+            } else {
+                *rpp = MAKE_ROOT(rp2, 0);
             }
         }
-    } else {
-        rp2 = new_root_dbterm(tb, obj);
-        rp2->next = rp1;
-        rp2->hvalue = hval;
-        ASSERT(nobj > 0);
-        if (nobj >= KEY_CHAIN_THRESHOLD) {
-            rp1 = create_stage_2_root(tb, rp2, rp3);
-            *rpp = MAKE_ROOT(rp1, 1);
-        } else {
-            *rpp = MAKE_ROOT(rp2, 0);
-        }
+        erts_smp_atomic_inc_nob(&tb->common.nitems);
     }
     nkeys = erts_smp_atomic_read_nob(&tb->nkeys);
 
 done:
-    erts_smp_atomic_inc_nob(&tb->common.nitems);
     WUNLOCK_HASH(lck);
     nactive = NACTIVE(tb);
-    if ((nkeys > nactive * (CHAIN_LEN + 1)) && (!IS_FIXED(tb)))
+    if ((nkeys > nactive * (CHAIN_LEN + 1)) && !IS_FIXED(tb))
         grow(tb, nactive);
     CHECK_TABLES();
     return DB_ERROR_NONE;
@@ -2286,7 +2302,6 @@ db_get_element_nhash(Process *p, DbTable *tbl,
     TrunkDbTerm *tp1, *tp2;
     erts_smp_rwmtx_t *lck;
     DbTableNestedHash *tb = &tbl->nested;
-    ASSERT(tb->common.status & (DB_BAG | DB_DUPLICATE_BAG));
     hval = MAKE_HASH(key);
     lck = RLOCK_HASH(tb, hval);
     ix = hash_to_ix(tb, hval);
@@ -2295,9 +2310,21 @@ db_get_element_nhash(Process *p, DbTable *tbl,
         rp2 = ROOT_PTR(rp1);
         if (has_key(tb, rp1, key, hval)) {
             if (rp2->hvalue == INVALID_HASH) {
-                if (HAS_TAIL(rp1))
+                if (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
                     break;
             } else {
+                if (tb->common.status & DB_SET) {
+                    ASSERT(!HAS_TAIL(rp1));
+                    if (ndex > arityval(rp2->dt.dbterm.tpl[0])) {
+                        RUNLOCK_HASH(lck);
+                        return DB_ERROR_BADITEM;
+                    }
+                    *ret = db_copy_element_from_ets(&tb->common, p,
+                                                    &rp2->dt.dbterm,
+                                                    ndex, &hp, 0);
+                    RUNLOCK_HASH(lck);
+                    return DB_ERROR_NONE;
+                }
                 if (HAS_TAIL(rp1)) {
                     /* !!! yield !!! */
                     tp1 = tp2 = TRUNK_PTR(rp2->dt.tail.trunk);
@@ -2372,7 +2399,7 @@ db_member_nhash(DbTable *tbl, Eterm key, Eterm *ret)
                 *ret = am_true;
                 break;
             }
-            if (HAS_TAIL(rp1))
+            if (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
                 break;
         }
         rp1 = rp2->next;
@@ -2402,7 +2429,7 @@ db_erase_nhash(DbTable *tbl, Eterm key, Eterm *ret)
         rp2 = ROOT_PTR(rp1);
         if (has_key(tb, rp1, key, hval)) {
             if (rp2->hvalue == INVALID_HASH) {
-                if (HAS_TAIL(rp1))
+                if (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
                     break;
                 rpp = &rp2->next;
             } else {
@@ -2413,7 +2440,7 @@ db_erase_nhash(DbTable *tbl, Eterm key, Eterm *ret)
                     nitems_diff += DELETE_RECORD_LIMIT;
                     max_free += DELETE_RECORD_LIMIT;
                 }
-                if (HAS_TAIL(rp1))
+                if (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
                     break;
             }
             pseudo_delete = 0; /* Pseudo-deleted the first RootDbTerm only */
@@ -2459,7 +2486,7 @@ db_erase_object_nhash(DbTable *tbl, Eterm object, Eterm *ret)
         rp2 = ROOT_PTR(rp1);
         if (has_key(tb, rp1, key, hval)) {
             if (rp2->hvalue == INVALID_HASH) {
-                if (HAS_TAIL(rp1))
+                if (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
                     break;
             } else {
                 if (!HAS_TAIL(rp1)) {
@@ -2470,7 +2497,7 @@ db_erase_object_nhash(DbTable *tbl, Eterm object, Eterm *ret)
                          * Pseudo-delete the first RootDbTerm only, delete
                          * for real all the others.
                          */
-                        if (pseudo_delete && (IS_FIXED(tb)) &&
+                        if (pseudo_delete && IS_FIXED(tb) &&
                             add_fixed_deletion(tb, ix, 0)) {
                             rp2->hvalue = INVALID_HASH;
                             rpp = &rp2->next;
@@ -2478,16 +2505,17 @@ db_erase_object_nhash(DbTable *tbl, Eterm object, Eterm *ret)
                             *rpp = rp2->next;
                             free_root_dbterm(tb, rp1);
                         }
-                        if (!(tb->common.status & (DB_DUPLICATE_BAG))) {
-                            /* Is there another RootDbTerm with same key? */
-                            if ((*rpp != NULL) &&
-                                has_key(tb, *rpp, key, hval))
-                                /* Yes, and it won't be pseudo-deleted */
-                                ++found;
-                            break;
+                        if (tb->common.status & DB_DUPLICATE_BAG) {
+                            pseudo_delete = 0;
+                            continue;
                         }
-                        pseudo_delete = 0;
-                        continue;
+                        /* Is there another RootDbTerm with same key? */
+                        if (!(tb->common.status & DB_SET) &&
+                            (*rpp != NULL) &&
+                            has_key(tb, *rpp, key, hval))
+                            /* Yes, and it won't be pseudo-deleted */
+                            ++found;
+                        break;
                     }
                 } else if (HAS_NLHT(rp2)) {
                     hval = MAKE_HASH(object);
@@ -2513,9 +2541,9 @@ db_erase_object_nhash(DbTable *tbl, Eterm object, Eterm *ret)
                                     break;
                                 }
                             }
-                            if (!(tb->common.status & (DB_DUPLICATE_BAG)))
-                                break;
-                            continue;
+                            if (tb->common.status & DB_DUPLICATE_BAG)
+                                continue;
+                            break;
                         }
                         ntpp = &ntp->onext;
                     }
@@ -2541,9 +2569,9 @@ db_erase_object_nhash(DbTable *tbl, Eterm object, Eterm *ret)
                                     break;
                                 }
                             }
-                            if (!(tb->common.status & (DB_DUPLICATE_BAG)))
-                                break;
-                            continue;
+                            if (tb->common.status & DB_DUPLICATE_BAG)
+                                continue;
+                            break;
                         }
                         tpp = &(*tpp)->next;
                     } while (*tpp != NULL);
@@ -3681,7 +3709,7 @@ db_take_nhash(Process *p, DbTable *tbl, Eterm key, Eterm *ret)
         rp2 = ROOT_PTR(rp1);
         if (has_key(tb, rp1, key, hval)) {
             if (rp2->hvalue == INVALID_HASH) {
-                if (HAS_TAIL(rp1))
+                if (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
                     break;
                 rpp = &rp2->next;
             } else {
@@ -3692,7 +3720,7 @@ db_take_nhash(Process *p, DbTable *tbl, Eterm key, Eterm *ret)
                 if (*ret == NIL)
                     *ret = build_term_list(p, rp1, 0, tb);
                 /*
-                 * ... then delete them one by one on every loop.
+                 * ... then delete them one by one.
                  */
                 fixed = pseudo_delete && IS_FIXED(tb) &&
                     add_fixed_deletion(tb, ix, 0);
@@ -3701,7 +3729,7 @@ db_take_nhash(Process *p, DbTable *tbl, Eterm key, Eterm *ret)
                     nitems_diff += DELETE_RECORD_LIMIT;
                     max_free += DELETE_RECORD_LIMIT;
                 }
-                if (HAS_TAIL(rp1))
+                if (HAS_TAIL(rp1) || (tb->common.status & DB_SET))
                     break;
             }
             pseudo_delete = 0; /* Pseudo-deleted the first RootDbTerm only */
@@ -3734,18 +3762,18 @@ db_free_table_continue_nhash(DbTable *tbl)
         erts_db_free(ERTS_ALC_T_DB_FIX_DEL, (DbTable *)tb,
                      (void *)fx, sizeof(NestedFixedDeletion));
         ERTS_ETS_MISC_MEM_ADD(-sizeof(NestedFixedDeletion));
-        if (max_free <= 0) {
+        if (--max_free <= 0) {
             erts_smp_atomic_set_relb(&tb->fixdel, (erts_aint_t)fixdel);
             /* Not done */
             return 0;
         }
-        --max_free;
     }
     erts_smp_atomic_set_relb(&tb->fixdel, (erts_aint_t)NULL);
     while (tb->nslots != 0) {
-        if (!free_seg(tb, &max_free))
+        if (!free_seg(tb, &max_free)) {
             /* If we have done enough work, get out here. */
             return 0;
+        }
     }
 #ifdef ERTS_SMP
     if (tb->locks != NULL) {
@@ -3975,6 +4003,127 @@ db_check_table_nhash(DbTable *tbl)
 }
 #endif
 
+static int
+db_lookup_dbterm_nhash(Process *p, DbTable *tbl, Eterm key,
+                       Eterm obj, DbUpdateHandle *handle)
+{
+    int arity, flags, nactive, nkeys;
+    Eterm *hend, *htop, *objp;
+    HashValue hval;
+    RootDbTerm **rpp;
+    RootDbTerm *rp2;
+    erts_smp_rwmtx_t *lck;
+    DbTableNestedHash *tb = &tbl->nested;
+    ASSERT(tb->common.status & DB_SET);
+    flags = 0;
+    hval = MAKE_HASH(key);
+    lck = WLOCK_HASH(tb, hval);
+    rpp = &BUCKET(tb, hash_to_ix(tb, hval));
+    while ((rp2 = *rpp) != NULL) {
+        ASSERT(!HAS_TAIL(rp2));
+        if (has_key(tb, rp2, key, hval)) {
+            if (rp2->hvalue != INVALID_HASH)
+                goto done;
+            break;
+        }
+        rpp = &rp2->next;
+    }
+    if (obj == THE_NON_VALUE) {
+        WUNLOCK_HASH(lck);
+        return 0;
+    }
+    objp = tuple_val(obj);
+    arity = arityval(*objp);
+    ASSERT(arity >= tb->common.keypos);
+    htop = HAlloc(p, arity + 1);
+    hend = htop + arity + 1;
+    sys_memcpy(htop, objp, sizeof(Eterm) * (arity + 1));
+    htop[tb->common.keypos] = key;
+    obj = make_tuple(htop);
+    erts_smp_atomic_inc_nob(&tb->common.nitems);
+    if (rp2 == NULL) {
+        rp2 = new_root_dbterm(tb, obj);
+        rp2->next = NULL;
+        rp2->hvalue = hval;
+        *rpp = MAKE_ROOT(rp2, 0);
+        nactive = NACTIVE(tb);
+        nkeys = erts_smp_atomic_inc_read_nob(&tb->nkeys);
+        if ((nkeys > nactive * (CHAIN_LEN + 1)) && (!IS_FIXED(tb)))
+            grow(tb, nactive);
+    } else {
+        ASSERT(rp2->hvalue == INVALID_HASH);
+        rp2 = replace_root_dbterm(tb, rp2, obj);
+        rp2->hvalue = hval;
+        *rpp = MAKE_ROOT(rp2, 0);
+        erts_smp_atomic_inc_nob(&tb->nkeys);
+    }
+    HRelease(p, hend, htop);
+    CHECK_TABLES();
+    flags |= DB_NEW_OBJECT;
+
+done:
+    handle->tb = tbl;
+    handle->bp = (void **)rpp;
+    handle->dbterm = &rp2->dt.dbterm;
+    handle->flags = flags;
+    handle->new_size = rp2->dt.dbterm.size;
+#if HALFWORD_HEAP
+    handle->abs_vec = NULL;
+#endif
+    handle->lck = lck;
+    return 1;
+}
+
+/*
+ * Must be called after call to db_lookup_dbterm
+ */
+static void
+db_finalize_dbterm_nhash(int cret, DbUpdateHandle *handle)
+{
+    DbTable *tbl = handle->tb;
+    RootDbTerm **rpp;
+    RootDbTerm *rp2;
+    erts_smp_rwmtx_t *lck = (erts_smp_rwmtx_t *)handle->lck;
+    DbTableNestedHash *tb = &tbl->nested;
+    ASSERT(tb->common.status & DB_SET);
+    rpp = (RootDbTerm **)handle->bp;
+    rp2 = *rpp;
+    /* locked by db_lookup_dbterm_nhash() */
+    ERTS_SMP_LC_ASSERT(IS_HASH_WLOCKED(tb, lck));
+    ASSERT((&rp2->dt.dbterm == handle->dbterm) ==
+           !(tb->common.compress && (handle->flags & DB_MUST_RESIZE)));
+    if ((handle->flags & DB_NEW_OBJECT) && (cret != DB_ERROR_NONE)) {
+        if (IS_FIXED(tb) &&
+            add_fixed_deletion(tb, hash_to_ix(tb, rp2->hvalue), 0)) {
+            rp2->hvalue = INVALID_HASH;
+        } else {
+            *rpp = rp2->next;
+            free_root_dbterm(tb, rp2);
+        }
+        WUNLOCK_HASH(lck);
+        erts_smp_atomic_dec_nob(&tb->common.nitems);
+        erts_smp_atomic_dec_nob(&tb->nkeys);
+        try_shrink(tb);
+        CHECK_TABLES();
+    } else if (handle->flags & DB_MUST_RESIZE) {
+        /*
+         * NOTE: db_finalize_resize() will write the new copy of *rp2 into
+         *       *(handle->bp) without using the macro MAKE_ROOT(). For a
+         *       set type ETS this is not a problem for *(handle->bp) =
+         *       MAKE_ROOT(rp2, 0) is equivalent to *(handle->bp) = rp2
+         *       (and an ASSERT()).
+         */
+        db_finalize_resize(handle, offsetof(RootDbTerm, dt));
+        WUNLOCK_HASH(lck);
+        free_root_dbterm(tb, rp2);
+    } else {
+        WUNLOCK_HASH(lck);
+    }
+#ifdef DEBUG
+    handle->dbterm = 0;
+#endif
+}
+
 
 /*
  * External interface
@@ -4010,8 +4159,8 @@ DbTableMethod db_nested_hash = {
 #else
     NULL,
 #endif
-    NULL,
-    NULL
+    db_lookup_dbterm_nhash,
+    db_finalize_dbterm_nhash
 };
 
 
@@ -4113,7 +4262,6 @@ db_get_element_array(DbTable *tbl, Eterm key, int ndex,
     TrunkDbTerm *tp1, *tp2;
     DbTableNestedHash *tb = &tbl->nested;
     ASSERT(!IS_FIXED(tbl)); /* no support for fixed tables here */
-    ASSERT(tb->common.status & (DB_BAG | DB_DUPLICATE_BAG));
     hval = MAKE_HASH(key);
     lck = RLOCK_HASH(tb, hval);
     ix = hash_to_ix(tb, hval);
@@ -4121,9 +4269,20 @@ db_get_element_array(DbTable *tbl, Eterm key, int ndex,
     while (rp1 != NULL) {
         rp2 = ROOT_PTR(rp1);
         if (has_key(tb, rp1, key, hval)) {
-            /* !!! yield !!! */
+            if (tb->common.status & DB_SET) {
+                ASSERT(!HAS_TAIL(rp1));
+                ASSERT(*num_ret > 0);
+                if (ndex > arityval(rp2->dt.dbterm.tpl[0])) {
+                    RUNLOCK_HASH(lck);
+                    return DB_ERROR_BADITEM;
+                }
+                ret[0] = rp2->dt.dbterm.tpl[ndex];
+                *num_ret = 1;
+                goto done;
+            }
             if (HAS_TAIL(rp1)) {
                 ASSERT(rp2->hvalue != INVALID_HASH);
+                /* !!! yield !!! */
                 tp1 = tp2 = TRUNK_PTR(rp2->dt.tail.trunk);
                 do {
                     if (ndex > arityval(tp1->dbterm.tpl[0])) {
@@ -4194,7 +4353,7 @@ db_erase_bag_exact2(DbTable *tbl, Eterm key, Eterm value)
     ix = hash_to_ix(tb, hval);
     rpp = &BUCKET(tb, ix);
     ASSERT(!IS_FIXED(tb));
-    ASSERT((tb->common.status & DB_BAG));
+    ASSERT(tb->common.status & DB_BAG);
     ASSERT(!tb->common.compress);
     while ((rp1 = *rpp) != NULL) {
         rp2 = ROOT_PTR(rp1);
