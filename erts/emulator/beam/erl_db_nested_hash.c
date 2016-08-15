@@ -4007,7 +4007,7 @@ static int
 db_lookup_dbterm_nhash(Process *p, DbTable *tbl, Eterm key,
                        Eterm obj, DbUpdateHandle *handle)
 {
-    int arity, flags, nactive, nkeys;
+    int arity, flags;
     Eterm *hend, *htop, *objp;
     HashValue hval;
     RootDbTerm **rpp;
@@ -4046,10 +4046,7 @@ db_lookup_dbterm_nhash(Process *p, DbTable *tbl, Eterm key,
         rp2->next = NULL;
         rp2->hvalue = hval;
         *rpp = MAKE_ROOT(rp2, 0);
-        nactive = NACTIVE(tb);
-        nkeys = erts_smp_atomic_inc_read_nob(&tb->nkeys);
-        if ((nkeys > nactive * (CHAIN_LEN + 1)) && (!IS_FIXED(tb)))
-            grow(tb, nactive);
+        flags |= DB_INC_TRY_GROW;
     } else {
         ASSERT(rp2->hvalue == INVALID_HASH);
         rp2 = replace_root_dbterm(tb, rp2, obj);
@@ -4067,9 +4064,6 @@ done:
     handle->dbterm = &rp2->dt.dbterm;
     handle->flags = flags;
     handle->new_size = rp2->dt.dbterm.size;
-#if HALFWORD_HEAP
-    handle->abs_vec = NULL;
-#endif
     handle->lck = lck;
     return 1;
 }
@@ -4083,6 +4077,7 @@ db_finalize_dbterm_nhash(int cret, DbUpdateHandle *handle)
     DbTable *tbl = handle->tb;
     RootDbTerm **rpp;
     RootDbTerm *rp2;
+    RootDbTerm *free_me = NULL;
     erts_smp_rwmtx_t *lck = (erts_smp_rwmtx_t *)handle->lck;
     DbTableNestedHash *tb = &tbl->nested;
     ASSERT(tb->common.status & DB_SET);
@@ -4098,27 +4093,38 @@ db_finalize_dbterm_nhash(int cret, DbUpdateHandle *handle)
             rp2->hvalue = INVALID_HASH;
         } else {
             *rpp = rp2->next;
-            free_root_dbterm(tb, rp2);
+            free_me = rp2;
         }
         WUNLOCK_HASH(lck);
         erts_smp_atomic_dec_nob(&tb->common.nitems);
         erts_smp_atomic_dec_nob(&tb->nkeys);
         try_shrink(tb);
         CHECK_TABLES();
-    } else if (handle->flags & DB_MUST_RESIZE) {
-        /*
-         * NOTE: db_finalize_resize() will write the new copy of *rp2 into
-         *       *(handle->bp) without using the macro MAKE_ROOT(). For a
-         *       set type ETS this is not a problem for *(handle->bp) =
-         *       MAKE_ROOT(rp2, 0) is equivalent to *(handle->bp) = rp2
-         *       (and an ASSERT()).
-         */
-        db_finalize_resize(handle, offsetof(RootDbTerm, dt));
-        WUNLOCK_HASH(lck);
-        free_root_dbterm(tb, rp2);
     } else {
-        WUNLOCK_HASH(lck);
+        if (handle->flags & DB_MUST_RESIZE) {
+            /*
+             * NOTE: db_finalize_resize() will write the new copy of *rp2 into
+             *       *(handle->bp) without using the macro MAKE_ROOT(). For a
+             *       set type ETS this is not a problem for *(handle->bp) =
+             *       MAKE_ROOT(rp2, 0) is equivalent to *(handle->bp) = rp2
+             *       (and an ASSERT()).
+             */
+            db_finalize_resize(handle, offsetof(RootDbTerm, dt));
+            free_me = rp2;
+        }
+        if (handle->flags & DB_INC_TRY_GROW) {
+            int nactive;
+            int nkeys = erts_smp_atomic_inc_read_nob(&tb->nkeys);
+            WUNLOCK_HASH(lck);
+            nactive = NACTIVE(tb);
+            if ((nkeys > nactive * (CHAIN_LEN + 1)) && (!IS_FIXED(tb)))
+                grow(tb, nactive);
+        } else {
+            WUNLOCK_HASH(lck);
+        }
     }
+    if (free_me != NULL)
+        free_root_dbterm(tb, free_me);
 #ifdef DEBUG
     handle->dbterm = 0;
 #endif
